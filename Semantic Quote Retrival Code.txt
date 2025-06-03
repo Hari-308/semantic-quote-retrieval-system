@@ -1,0 +1,151 @@
+# SIMPLIFIED RAG QUOTE SEARCH (OUTPUTS LINK ONLY)
+import pandas as pd
+import ast
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+import os
+import json
+import socket
+from contextlib import closing
+import torch
+
+# ======================
+# 1. DATA PROCESSING
+# ======================
+print("🔄 Loading and processing data...")
+
+try:
+    df = pd.read_csv("English Quotes.csv", encoding='utf-8-sig')
+    df = df.dropna(subset=['quote']).reset_index(drop=True)
+    df['author'] = df['author'].fillna("unknown")
+    
+    def parse_tags(tag_str):
+        try:
+            if pd.isna(tag_str) or str(tag_str).strip() == "":
+                return ["untagged"]
+            if isinstance(tag_str, list):
+                return tag_str
+            return ast.literal_eval(str(tag_str))
+        except:
+            return ["malformed-tags"]
+    
+    df['tags'] = df['tags'].apply(parse_tags)
+    df['clean_quote'] = df['quote'].str.lower().str.replace(r'[^\w\s.,!?\'-]', '', regex=True)
+    print(f"✅ Processed {len(df)} quotes")
+
+except Exception as e:
+    print(f"❌ Error processing data: {str(e)}")
+    raise
+
+# ======================
+# 2. BUILD RAG SYSTEM
+# ======================
+print("🔧 Building RAG index...")
+
+try:
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+    
+    if str(model.device) == 'meta':
+        model.to('cpu')
+    
+    embeddings = model.encode(df['clean_quote'].tolist(), 
+                            show_progress_bar=False,
+                            device=device)
+    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+    
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    print("✅ FAISS index built successfully")
+
+except Exception as e:
+    print(f"❌ Error building RAG system: {str(e)}")
+    raise
+
+# ======================
+# 3. GENERATE STREAMLIT APP
+# ======================
+print("🚀 Creating Streamlit app...")
+
+def find_free_port():
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(('', 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
+
+df_json = df.where(pd.notnull(df), None).to_dict('records')
+embeddings_json = embeddings.tolist()
+
+APP_CODE = f"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+import torch
+
+# MUST BE FIRST COMMAND
+st.set_page_config(layout="wide")
+
+@st.cache_resource
+def load_model():
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+    if str(model.device) == 'meta':
+        model.to('cpu')
+    return model
+
+df = pd.DataFrame({json.dumps(df_json)})
+model = load_model()
+embeddings = np.array({json.dumps(embeddings_json)})
+index = faiss.IndexFlatIP(embeddings.shape[1])
+index.add(embeddings)
+
+def search(query, top_k=3):
+    query_embed = model.encode([query], device=model.device)
+    query_embed = query_embed / np.linalg.norm(query_embed)
+    scores, indices = index.search(query_embed, top_k)
+    results_df = df.iloc[indices[0]].copy()
+    results_df['score'] = scores[0]
+    return results_df.sort_values('score', ascending=False)
+
+st.title("🔍 Interactive Quote Search")
+
+col1, col2 = st.columns([1, 3])
+with col1:
+    st.image("https://cdn-icons-png.flaticon.com/512/1570/1570887.png", width=100)
+    query = st.text_input("Search for quotes:")
+    top_k = st.slider("Number of results", 1, 10, 3)
+
+with col2:
+    if query:
+        results_df = search(query, top_k)
+        st.subheader(f"Top {{len(results_df)}} matches:")
+        for _, row in results_df.iterrows():
+            st.markdown(f'''
+            <div style="
+                background: #f0f2f6;
+                border-radius: 10px;
+                padding: 15px;
+                margin: 10px 0;
+            ">
+            <p style="font-size: 18px; font-style: italic;">"{{row['quote']}}"</p>
+            <p>— <strong>{{row['author'] if row['author'] else 'Unknown'}}</strong></p>
+            <p>Tags: {{', '.join(row['tags']) if row['tags'] else 'untagged'}} | Score: {{row['score']:.3f}}</p>
+            </div>
+            ''', unsafe_allow_html=True)
+"""
+
+with open("temp_app.py", "w", encoding='utf-8') as f:
+    f.write(APP_CODE)
+
+# ======================
+# 4. RUN STREAMLIT
+# ======================
+port = find_free_port()
+print(f"\n🔗 YOUR QUOTE SEARCH APP IS READY AT:")
+print(f"👉 http://localhost:{port}\n")
+
+# Start Streamlit server in background
+os.system(f"streamlit run temp_app.py --server.port {port} --server.headless true &")
